@@ -609,6 +609,13 @@ struct CompanionPanelView: View {
             HStack(spacing: 0) {
                 modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
                 modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
+                // Thin separator between Claude and OpenAI model groups
+                Rectangle()
+                    .fill(DS.Colors.borderSubtle)
+                    .frame(width: 0.5)
+                    .padding(.vertical, 4)
+                modelOptionButton(label: "GPT-5", modelID: "gpt-5")
+                modelOptionButton(label: "GPT-5 mini", modelID: "gpt-5-mini")
             }
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -630,7 +637,7 @@ struct CompanionPanelView: View {
             Text(label)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
-                .padding(.horizontal, 10)
+                .padding(.horizontal, 8)
                 .padding(.vertical, 5)
                 .background(
                     RoundedRectangle(cornerRadius: 5, style: .continuous)

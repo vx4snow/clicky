@@ -70,11 +70,31 @@ final class CompanionManager: ObservableObject {
 
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
+    /// Set via the WorkerBaseURL key in Info.plist — change it there to
+    /// switch between local dev (http://localhost:8787) and production.
+    private static let workerBaseURL = AppBundleConfiguration.stringValue(forKey: "WorkerBaseURL") ?? "http://localhost:8787"
 
+    /// Claude API client. Used for regular chat when Claude is the selected provider,
+    /// and always used for the onboarding demo (which requires reliable pointing behavior).
+    /// If the user's saved model is an OpenAI model, Claude is initialized with Sonnet
+    /// as a sensible default so the onboarding demo always has a working Claude client.
     private lazy var claudeAPI: ClaudeAPI = {
-        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
+        let claudeModel = selectedModel.hasPrefix("gpt") ? "claude-sonnet-4-6" : selectedModel
+        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: claudeModel)
     }()
+
+    /// OpenAI API client. Used when the user selects a GPT model.
+    /// Initialized lazily so the TLS warmup only fires if OpenAI is actually used.
+    private lazy var openAIAPI: OpenAIAPI = {
+        let openAIModel = selectedModel.hasPrefix("gpt") ? selectedModel : "gpt-5"
+        return OpenAIAPI(proxyURL: "\(Self.workerBaseURL)/openai-chat", model: openAIModel)
+    }()
+
+    /// Returns the AI client matching the user's currently selected model.
+    /// Routes to OpenAIAPI for GPT models, ClaudeAPI for everything else.
+    private var currentAIAPI: any AICompanionAPI {
+        selectedModel.hasPrefix("gpt") ? openAIAPI : claudeAPI
+    }
 
     private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
         return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
@@ -113,7 +133,13 @@ final class CompanionManager: ObservableObject {
     func setSelectedModel(_ model: String) {
         selectedModel = model
         UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
-        claudeAPI.model = model
+        // Update the model on the appropriate client so it takes effect immediately
+        // without needing to re-create the client and lose its TLS warmup state.
+        if model.hasPrefix("gpt") {
+            openAIAPI.model = model
+        } else {
+            claudeAPI.model = model
+        }
     }
 
     /// User preference for whether the Clicky cursor should be shown.
@@ -610,7 +636,7 @@ final class CompanionManager: ObservableObject {
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                let (fullResponseText, _) = try await currentAIAPI.analyzeImageStreaming(
                     images: labeledImages,
                     systemPrompt: Self.companionVoiceResponseSystemPrompt,
                     conversationHistory: historyForAPI,

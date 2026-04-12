@@ -6,7 +6,8 @@
 import Foundation
 
 /// Claude API helper with streaming for progressive text display.
-class ClaudeAPI {
+/// Conforms to AICompanionAPI so CompanionManager can use it interchangeably with OpenAIAPI.
+class ClaudeAPI: AICompanionAPI {
     private static let tlsWarmupLock = NSLock()
     private static var hasStartedTLSWarmup = false
 

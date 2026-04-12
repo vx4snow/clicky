@@ -1,20 +1,25 @@
 //
 //  OpenAIAPI.swift
-//  OpenAI API Implementation
+//  leanring-buddy
+//
+//  OpenAI API client with SSE streaming, routed through the Cloudflare Worker proxy.
+//  Conforms to AICompanionAPI so CompanionManager can use it interchangeably with ClaudeAPI.
 //
 
 import Foundation
 
-/// OpenAI API helper for vision analysis
-class OpenAIAPI {
-    private let apiKey: String
+/// OpenAI API helper with streaming for progressive text display.
+/// All requests route through the Cloudflare Worker proxy — no API key ships in the app.
+class OpenAIAPI: AICompanionAPI {
+    private static let tlsWarmupLock = NSLock()
+    private static var hasStartedTLSWarmup = false
+
     private let apiURL: URL
-    private let model: String
+    var model: String
     private let session: URLSession
 
-    init(apiKey: String, model: String = "gpt-5.2-2025-12-11") {
-        self.apiKey = apiKey
-        self.apiURL = URL(string: "https://api.openai.com/v1/chat/completions")!
+    init(proxyURL: String, model: String = "gpt-5") {
+        self.apiURL = URL(string: proxyURL)!
         self.model = model
 
         // Use .default instead of .ephemeral so TLS session tickets are cached.
@@ -30,15 +35,40 @@ class OpenAIAPI {
         self.session = URLSession(configuration: config)
 
         // Fire a lightweight HEAD request in the background to pre-establish the TLS
-        // connection. This caches the TLS session ticket so the first real API call
-        // (which carries a large image payload) doesn't need a cold TLS handshake.
-        warmUpTLSConnection()
+        // connection before the first real API call arrives with a large image payload.
+        warmUpTLSConnectionIfNeeded()
+    }
+
+    private func makeAPIRequest() -> URLRequest {
+        var request = URLRequest(url: apiURL)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 120
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return request
     }
 
     /// Sends a no-op HEAD request to the API host to establish and cache a TLS session.
     /// Failures are silently ignored — this is purely an optimization.
-    private func warmUpTLSConnection() {
-        var warmupRequest = URLRequest(url: apiURL)
+    private func warmUpTLSConnectionIfNeeded() {
+        Self.tlsWarmupLock.lock()
+        let shouldStartTLSWarmup = !Self.hasStartedTLSWarmup
+        if shouldStartTLSWarmup {
+            Self.hasStartedTLSWarmup = true
+        }
+        Self.tlsWarmupLock.unlock()
+
+        guard shouldStartTLSWarmup else { return }
+
+        guard var warmupURLComponents = URLComponents(url: apiURL, resolvingAgainstBaseURL: false) else {
+            return
+        }
+        warmupURLComponents.path = "/"
+        warmupURLComponents.query = nil
+        warmupURLComponents.fragment = nil
+
+        guard let warmupURL = warmupURLComponents.url else { return }
+
+        var warmupRequest = URLRequest(url: warmupURL)
         warmupRequest.httpMethod = "HEAD"
         warmupRequest.timeoutInterval = 10
         session.dataTask(with: warmupRequest) { _, _, _ in
@@ -46,38 +76,34 @@ class OpenAIAPI {
         }.resume()
     }
 
-    /// Send a vision request to OpenAI with one or more labeled images.
-    func analyzeImage(
+    /// Sends a vision request to OpenAI via the proxy with SSE streaming.
+    /// Calls `onTextChunk` on the main actor each time new text arrives so the UI updates progressively.
+    /// Returns the full accumulated text and total duration when the stream completes.
+    ///
+    /// OpenAI's SSE format differs from Anthropic's: text chunks arrive as
+    /// `choices[0].delta.content` rather than `content_block_delta`.
+    func analyzeImageStreaming(
         images: [(data: Data, label: String)],
         systemPrompt: String,
         conversationHistory: [(userPlaceholder: String, assistantResponse: String)] = [],
-        userPrompt: String
+        userPrompt: String,
+        onTextChunk: @MainActor @Sendable (String) -> Void
     ) async throws -> (text: String, duration: TimeInterval) {
         let startTime = Date()
+        var request = makeAPIRequest()
 
-        // Build request
-        var request = URLRequest(url: apiURL)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 120
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-        // Build messages array
+        // Build messages array — OpenAI requires system message as a separate role
         var messages: [[String: Any]] = []
+        messages.append(["role": "system", "content": systemPrompt])
 
-        // Add system message first
-        messages.append([
-            "role": "system",
-            "content": systemPrompt
-        ])
-
-        // Add conversation history
         for (userPlaceholder, assistantResponse) in conversationHistory {
             messages.append(["role": "user", "content": userPlaceholder])
             messages.append(["role": "assistant", "content": assistantResponse])
         }
 
-        // Build current message with all labeled images + prompt
+        // Build current message with all labeled images + prompt.
+        // OpenAI's image format uses "image_url" with a data URI rather than
+        // Anthropic's "image" + "source" + "base64" structure.
         var contentBlocks: [[String: Any]] = []
         for image in images {
             contentBlocks.append([
@@ -97,46 +123,69 @@ class OpenAIAPI {
         ])
         messages.append(["role": "user", "content": contentBlocks])
 
-        // Build request body
         let body: [String: Any] = [
             "model": model,
-            // `max_tokens` is deprecated/incompatible for some newer OpenAI models.
-            "max_completion_tokens": 600,
+            "max_completion_tokens": 1024,
+            "stream": true,
             "messages": messages
         ]
 
         let bodyData = try JSONSerialization.data(withJSONObject: body)
         request.httpBody = bodyData
         let payloadMB = Double(bodyData.count) / 1_048_576.0
-        print("🌐 OpenAI request: \(String(format: "%.1f", payloadMB))MB, \(images.count) image(s)")
+        print("🌐 OpenAI streaming request: \(String(format: "%.1f", payloadMB))MB, \(images.count) image(s)")
 
-        // Send request
-        let (data, response) = try await session.data(for: request)
+        // Use bytes streaming for SSE (Server-Sent Events)
+        let (byteStream, response) = try await session.bytes(for: request)
 
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200...299).contains(httpResponse.statusCode) else {
-            let responseString = String(data: data, encoding: .utf8) ?? "Unknown error"
-            throw NSError(
-                domain: "OpenAIAPI",
-                code: (response as? HTTPURLResponse)?.statusCode ?? -1,
-                userInfo: [NSLocalizedDescriptionKey: "API Error: \(responseString)"]
-            )
-        }
-
-        // Parse response
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        guard let choices = json?["choices"] as? [[String: Any]],
-              let firstChoice = choices.first,
-              let message = firstChoice["message"] as? [String: Any],
-              let text = message["content"] as? String else {
+        guard let httpResponse = response as? HTTPURLResponse else {
             throw NSError(
                 domain: "OpenAIAPI",
                 code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Invalid response format"]
+                userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response"]
             )
         }
 
+        guard (200...299).contains(httpResponse.statusCode) else {
+            var errorBodyChunks: [String] = []
+            for try await line in byteStream.lines {
+                errorBodyChunks.append(line)
+            }
+            let errorBody = errorBodyChunks.joined(separator: "\n")
+            throw NSError(
+                domain: "OpenAIAPI",
+                code: httpResponse.statusCode,
+                userInfo: [NSLocalizedDescriptionKey: "API Error (\(httpResponse.statusCode)): \(errorBody)"]
+            )
+        }
+
+        // Parse SSE stream — each event is "data: {json}\n\n"
+        var accumulatedResponseText = ""
+
+        for try await line in byteStream.lines {
+            // SSE lines look like: "data: {...}"
+            guard line.hasPrefix("data: ") else { continue }
+            let jsonString = String(line.dropFirst(6)) // Drop "data: " prefix
+
+            // End of stream marker
+            guard jsonString != "[DONE]" else { break }
+
+            guard let jsonData = jsonString.data(using: .utf8),
+                  let eventPayload = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                  let choices = eventPayload["choices"] as? [[String: Any]],
+                  let firstChoice = choices.first,
+                  let delta = firstChoice["delta"] as? [String: Any],
+                  let textChunk = delta["content"] as? String else {
+                continue
+            }
+
+            accumulatedResponseText += textChunk
+            // Send the accumulated text so far to the UI for progressive rendering
+            let currentAccumulatedText = accumulatedResponseText
+            await onTextChunk(currentAccumulatedText)
+        }
+
         let duration = Date().timeIntervalSince(startTime)
-        return (text: text, duration: duration)
+        return (text: accumulatedResponseText, duration: duration)
     }
 }
